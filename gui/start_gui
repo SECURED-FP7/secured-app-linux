@@ -1,0 +1,5 @@
+#!/bin/bash
+
+cd /home/alice/netIT-Lab/gitlab/app/gui
+sudo python client_main.py
+

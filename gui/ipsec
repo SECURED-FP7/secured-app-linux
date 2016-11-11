@@ -1,0 +1,32 @@
+#!/bin/bash
+# Note: 
+# You don't have to modify this file, if you don't want to 
+# use terminal sudo password query instead of the graphical gksu. 
+# 
+# You have to modify this, if you don't use the default command to start ipsec, i.e.:
+# ./starter --daemon charon --nofork
+#
+
+cd /usr/libexec/strongswan
+
+# Use terminal sudo instead of gksu
+# Enable only this if you don't have gksu
+#sudo -- bash -c 'kill -9 `cat /var/run/charon.pid`;kill -9 `cat /var/run/starter.charon.pid`;./starter --daemon charon --nofork'
+
+# KILL PREVIOUS charon 
+echo "killing charon, pid:" `cat /var/run/charon.pid`
+echo "killing starter.charon, pid:" `cat /var/run/starter.charon.pid`
+echo
+
+gksu -k -u root --message "Enter your password to perform admininstrative tasks." -- bash -c 'kill -9 `cat /var/run/charon.pid` > /dev/null 2>&1; kill -9 `cat /var/run/starter.charon.pid` > /dev/null 2>&1; sleep 0.5; ./starter --daemon charon --nofork'
+
+#DON'T KILL PREVIOUS if you want to debug errors
+#gksu -k -u root --message "Enter your password to perform admininstrative tasks." -- bash -c './starter --daemon charon --nofork'
+
+
+# Remove below lines if you don't want info of, e.g., IPSEC already open. Should not get here 
+echo
+echo -n "Start exited. Press enter to close terminal." 
+read -n 1 command
+
+

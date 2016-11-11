@@ -1,0 +1,573 @@
+diff --git a/configure.ac b/configure.ac
+index 8f4d763..0675655 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -244,8 +244,9 @@ ARG_ENABL_SET([tnccs-dynamic],  [enable dynamic TNCCS protocol discovery module.
+ # misc plugins
+ ARG_ENABL_SET([android-log],    [enable Android specific logger plugin.])
+ ARG_ENABL_SET([certexpire],     [enable CSV export of expiration dates of used certificates.])
++ARG_ENABL_SET([oat-attest],     [enable peer attestation with OpenAttestation.])
+ ARG_ENABL_SET([connmark],       [enable connmark plugin using conntrack based marks to select return path SA.])
+ ARG_ENABL_SET([forecast],       [enable forecast plugin forwarding broadcast/multicast messages.])
+ ARG_ENABL_SET([duplicheck],     [advanced duplicate checking plugin using liveness checks.])
+ ARG_ENABL_SET([error-notify],   [enable error notification plugin.])
+ ARG_ENABL_SET([farp],           [enable ARP faking plugin that responds to ARP requests to peers virtual IP])
+@@ -1273,6 +1274,7 @@ ADD_PLUGIN([whitelist],            [c charon])
+ ADD_PLUGIN([lookip],               [c charon])
+ ADD_PLUGIN([error-notify],         [c charon])
+ ADD_PLUGIN([certexpire],           [c charon])
++ADD_PLUGIN([oat-attest],           [c charon])
+ ADD_PLUGIN([systime-fix],          [c charon])
+ ADD_PLUGIN([led],                  [c charon])
+ ADD_PLUGIN([duplicheck],           [c charon])
+@@ -1384,6 +1386,7 @@ AM_CONDITIONAL(USE_WHITELIST, test x$whitelist = xtrue)
+ AM_CONDITIONAL(USE_LOOKIP, test x$lookip = xtrue)
+ AM_CONDITIONAL(USE_ERROR_NOTIFY, test x$error_notify = xtrue)
+ AM_CONDITIONAL(USE_CERTEXPIRE, test x$certexpire = xtrue)
++AM_CONDITIONAL(USE_OAT_ATTEST, test x$oat_attest = xtrue)
+ AM_CONDITIONAL(USE_SYSTIME_FIX, test x$systime_fix = xtrue)
+ AM_CONDITIONAL(USE_LED, test x$led = xtrue)
+ AM_CONDITIONAL(USE_DUPLICHECK, test x$duplicheck = xtrue)
+@@ -1681,6 +1684,7 @@ AC_CONFIG_FILES([
+ 	src/libcharon/plugins/lookip/Makefile
+ 	src/libcharon/plugins/error_notify/Makefile
+ 	src/libcharon/plugins/certexpire/Makefile
++	src/libcharon/plugins/oat_attest/Makefile
+ 	src/libcharon/plugins/systime_fix/Makefile
+ 	src/libcharon/plugins/led/Makefile
+ 	src/libcharon/plugins/duplicheck/Makefile
+diff --git a/src/libcharon/Makefile.am b/src/libcharon/Makefile.am
+index e81c424..2e8c328 100644
+--- a/src/libcharon/Makefile.am
++++ b/src/libcharon/Makefile.am
+@@ -531,6 +531,13 @@ if MONOLITHIC
+ endif
+ endif
+ 
++if USE_OAT_ATTEST
++  SUBDIRS += plugins/oat_attest
++if MONOLITHIC
++  libcharon_la_LIBADD += plugins/oat_attest/libstrongswan-oat-attest.la
++endif
++endif
++
+ if USE_SYSTIME_FIX
+   SUBDIRS += plugins/systime_fix
+ if MONOLITHIC
+diff --git a/src/libcharon/plugins/oat_attest/Makefile.am b/src/libcharon/plugins/oat_attest/Makefile.am
+new file mode 100644
+index 0000000..427cfdb
+--- /dev/null
++++ b/src/libcharon/plugins/oat_attest/Makefile.am
+@@ -0,0 +1,21 @@
++AM_CPPFLAGS = \
++	-I$(top_srcdir)/src/libstrongswan \
++	-I$(top_srcdir)/src/libhydra \
++	-I$(top_srcdir)/src/libcharon \
++	-DIPSEC_PIDDIR=\"${piddir}\"
++
++AM_CFLAGS = \
++	-rdynamic
++
++if MONOLITHIC
++noinst_LTLIBRARIES = libstrongswan-oat-attest.la
++else
++plugin_LTLIBRARIES = libstrongswan-oat-attest.la
++endif
++
++libstrongswan_oat_attest_la_LIBADD = -ljson
++
++libstrongswan_oat_attest_la_SOURCES = oat_attest_plugin.h oat_attest_plugin.c \
++	oat_attest_listener.h oat_attest_listener.c
++
++libstrongswan_oat_attest_la_LDFLAGS = -module -avoid-version
+diff --git a/src/libcharon/plugins/oat_attest/oat_attest_listener.c b/src/libcharon/plugins/oat_attest/oat_attest_listener.c
+new file mode 100644
+index 0000000..97ebc04
+--- /dev/null
++++ b/src/libcharon/plugins/oat_attest/oat_attest_listener.c
+@@ -0,0 +1,261 @@
++/*
++ * Copyright (C) 2011 Martin Willi
++ * Copyright (C) 2011 revosec AG
++ * Copyright (C) 2014 Politecnico di Torino, Italy
++ *                    TORSEC group -- http://security.polito.it
++ *
++ * Author: Roberto Sassu <roberto.sassu@polito.it>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include "oat_attest_listener.h"
++
++#include <daemon.h>
++#include <json/json.h>
++
++#define MAX_BUF_LEN 256
++#define COLOR_NORMAL  "\x1B[0m"
++#define COLOR_RED  "\x1B[31m"
++#define COLOR_GREEN  "\x1B[32m"
++#define POLLHOST_URL "https://%s:8443/AttestationService/resources/PollHosts"
++#define POSTHOST_URL "https://%s:8443/AttestationService/resources/PostHosts?requestId=%s"
++
++
++typedef struct private_oat_attest_listener_t private_oat_attest_listener_t;
++
++/**
++ * Private data of an oat_attest_listener_t object.
++ */
++struct private_oat_attest_listener_t {
++
++	/**
++	 * Public oat_attest_listener_t interface.
++	 */
++	oat_attest_listener_t public;
++};
++
++bool oat_attest_request(char *peer_hostname, char *peer_cert_digest)
++{
++	struct json_tokener *tokener;
++	chunk_t data, response = chunk_empty;
++	json_object *jresponse, *response_array;
++	status_t status;
++	char uri[MAX_BUF_LEN] = { 0 };
++	char user_reqs[MAX_BUF_LEN] = { 0 };
++	char *oat_server, *request_id, *ima_level, *msg;
++	char *peer_trust_level = NULL;
++	bool attest_result = false;
++
++	/* build the OAT request */
++	json_object *jrequest = json_object_new_object();
++	json_object *jarray = json_object_new_array();
++	json_object *jstring_host = json_object_new_string(peer_hostname);
++	json_object *jstring_reqs;
++
++	ima_level = lib->settings->get_str(lib->settings,
++					   "%s.plugins.oat-attest.ima_level",
++					   NULL, lib->ns);
++	if (!ima_level)
++		ima_level = "l4_ima_all_ok";
++
++	snprintf(user_reqs, MAX_BUF_LEN,
++		 "load-time+check-cert,l_req=%s|>=,cert_digest=%s", ima_level,
++		 peer_cert_digest);
++
++	jstring_reqs = json_object_new_string(user_reqs);
++	json_object_array_add(jarray, jstring_host);
++	json_object_object_add(jrequest, "hosts", jarray);
++	json_object_object_add(jrequest, "analysisType", jstring_reqs);
++	data = chunk_from_str((char*)json_object_to_json_string(jrequest));
++
++	DBG0(DBG_LIB, "\nUser terminal -> verifier:\nrequest: %s", data.ptr, data.len);
++
++	/* send the request to OAT */
++	oat_server = lib->settings->get_str(lib->settings,
++					    "%s.plugins.oat-attest.oat_server",
++					    NULL, lib->ns);
++	if (!oat_server) {
++		DBG0(DBG_LIB, "Error: the oat_server parameter must be set");
++		goto out;
++	}
++
++	request_id = lib->settings->get_str(lib->settings,
++					    "%s.plugins.oat-attest.request_id",
++					    NULL, lib->ns);
++
++	if (request_id) {
++		snprintf(uri, MAX_BUF_LEN, POSTHOST_URL, oat_server, request_id);
++		status = lib->fetcher->fetch(lib->fetcher, uri, &response,
++					FETCH_TIMEOUT, 120,
++					FETCH_REQUEST_TYPE, "application/json",
++					FETCH_END);
++	} else {
++		snprintf(uri, MAX_BUF_LEN, POLLHOST_URL, oat_server);
++		status = lib->fetcher->fetch(lib->fetcher, uri, &response,
++					FETCH_TIMEOUT, 120,
++					FETCH_REQUEST_TYPE, "application/json",
++					FETCH_REQUEST_DATA, data,
++					FETCH_END);
++	}
++
++	msg = strndup(response.ptr, response.len);
++	DBG0(DBG_LIB, "\nVerifier -> user terminal:\nresponse: %s\n", msg);
++	free(msg);
++
++	if (status != SUCCESS)
++		goto out;
++
++	/* parse the OAT response */
++	tokener = json_tokener_new();
++	jresponse = json_tokener_parse_ex(tokener, response.ptr, response.len);
++	json_object_object_get_ex(jresponse, "hosts", &response_array);
++	int i, count = json_object_array_length(response_array);
++	for (i = 0; i < count; i++) {
++		json_object *jvalue = json_object_array_get_idx(response_array, i);
++		json_object *host_name;
++		json_object *trust_lvl;
++
++		json_object_object_get_ex(jvalue, "host_name", &host_name);
++		if (strcmp(json_object_get_string(host_name), peer_hostname) == 0) {
++			json_object_object_get_ex(jvalue, "trust_lvl", &trust_lvl);
++			peer_trust_level = strdup(json_object_get_string(trust_lvl));
++			attest_result = strcmp(peer_trust_level, "trusted") == 0;
++			break;
++		}
++	}
++
++	json_tokener_free(tokener);
++	free(response.ptr);
++	json_object_put(jresponse);
++	json_object_put(response_array);
++
++out:
++	json_object_put(jstring_host);
++	json_object_put(jstring_reqs);
++	json_object_put(jarray);
++	json_object_put(jrequest);
++
++	if (attest_result) {
++		DBG0(DBG_LIB, "%sHost: %s, status: %s%s", COLOR_GREEN,
++		     peer_hostname, peer_trust_level, COLOR_NORMAL);
++	} else {
++		char *trust_level = peer_trust_level ? peer_trust_level : "unknown";
++		DBG0(DBG_LIB, "%sWARNING! WARNING! WARNING! Host: %s, status: %s%s",
++		     COLOR_RED, peer_hostname, trust_level, COLOR_NORMAL);
++	}
++
++	free(peer_trust_level);
++
++	return attest_result;
++}
++
++METHOD(listener_t, authorize, bool,
++	private_oat_attest_listener_t *this, ike_sa_t *ike_sa,
++	bool final, bool *success)
++{
++	enumerator_t *rounds;
++	certificate_t *cert;
++	auth_cfg_t *auth;
++	bool attest_peer;
++
++	/* Check all rounds in final hook, as local authentication data are
++	 * not completely available after round-invocation. */
++	if (!final)
++	{
++		return TRUE;
++	}
++
++	attest_peer = lib->settings->get_bool(lib->settings,
++					      "%s.plugins.oat-attest.attest_peer",
++					      FALSE, lib->ns);
++	if (!attest_peer)
++	{
++		return TRUE;
++	}
++
++	DBG0(DBG_LIB, "\n\n---------- Remote Attestation begins ----------\n");
++	/* collect remote certificates */
++	rounds = ike_sa->create_auth_cfg_enumerator(ike_sa, FALSE);
++	while (rounds->enumerate(rounds, &auth))
++	{
++		cert = auth->get(auth, AUTH_RULE_SUBJECT_CERT);
++		if (cert)
++		{
++			enumerator_t *parts;
++			id_part_t part;
++			chunk_t data;
++			identification_t *id;
++			hasher_t *hasher;
++			chunk_t encoded;
++			chunk_t cert_digest;
++
++			/* extract common name for OAT query */
++			id = cert->get_subject(cert);
++			parts = id->create_part_enumerator(id);
++			while (parts->enumerate(parts, &part, &data))
++			{
++				if (part == ID_PART_RDN_CN) {
++					DBG0(DBG_LIB, "Extracted Common Name from peer certificate: %s", data.ptr);
++					break;
++				}
++			}
++			parts->destroy(parts);
++
++			/* calculate and display the digest of the peer cert */
++			if (cert->get_encoding(cert, CERT_ASN1_DER, &encoded)) {
++				char digest_str[41];
++				char *hostname;
++				int rc;
++
++				hasher = lib->crypto->create_hasher(lib->crypto, HASH_SHA1);
++				rc = hasher->allocate_hash(hasher, encoded, &cert_digest);
++				chunk_to_hex(cert_digest, digest_str, false);
++				DBG0(DBG_LIB, "SHA1 of the peer certificate: %s", digest_str);
++				hostname = strndup(data.ptr, data.len);
++				*success = oat_attest_request(hostname, digest_str);
++				free(hostname);
++				chunk_clear(&cert_digest);
++				chunk_clear(&encoded);
++				DESTROY_IF(hasher);
++			}
++			chunk_clear(&data);
++		}
++	}
++	rounds->destroy(rounds);
++	DBG0(DBG_LIB, "\n---------- Remote Attestation ends ----------\n\n");
++	return TRUE;
++}
++
++METHOD(oat_attest_listener_t, destroy, void,
++	private_oat_attest_listener_t *this)
++{
++	free(this);
++}
++
++/**
++ * See header
++ */
++oat_attest_listener_t *oat_attest_listener_create()
++{
++	private_oat_attest_listener_t *this;
++
++	INIT(this,
++		.public = {
++			.listener = {
++				.authorize = _authorize,
++			},
++			.destroy = _destroy,
++		},
++	);
++
++	return &this->public;
++}
+diff --git a/src/libcharon/plugins/oat_attest/oat_attest_listener.h b/src/libcharon/plugins/oat_attest/oat_attest_listener.h
+new file mode 100644
+index 0000000..383633e
+--- /dev/null
++++ b/src/libcharon/plugins/oat_attest/oat_attest_listener.h
+@@ -0,0 +1,55 @@
++/*
++ * Copyright (C) 2011 Martin Willi
++ * Copyright (C) 2011 revosec AG
++ * Copyright (C) 2014 Politecnico di Torino, Italy
++ *                    TORSEC group -- http://security.polito.it
++ *
++ * Author: Roberto Sassu <roberto.sassu@polito.it>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++/**
++ * @defgroup oat_attest_listener oat_attest_listener
++ * @{ @ingroup oat_attest
++ */
++
++#ifndef CERTEXPIRE_LISTENER_H_
++#define CERTEXPIRE_LISTENER_H_
++
++#include <bus/listeners/listener.h>
++
++typedef struct oat_attest_listener_t oat_attest_listener_t;
++
++/**
++ * Listener collecting certificate expire information after authentication.
++ */
++struct oat_attest_listener_t {
++
++	/**
++	 * Implements listener_t interface.
++	 */
++	listener_t listener;
++
++	/**
++	 * Destroy a oat_attest_listener_t.
++	 */
++	void (*destroy)(oat_attest_listener_t *this);
++};
++
++/**
++ * Create a oat_attest_listener instance.
++ *
++ * @return				listener instance
++ */
++oat_attest_listener_t *oat_attest_listener_create();
++
++#endif /** CERTEXPIRE_LISTENER_H_ @}*/
+diff --git a/src/libcharon/plugins/oat_attest/oat_attest_plugin.c b/src/libcharon/plugins/oat_attest/oat_attest_plugin.c
+new file mode 100644
+index 0000000..669e5c5
+--- /dev/null
++++ b/src/libcharon/plugins/oat_attest/oat_attest_plugin.c
+@@ -0,0 +1,104 @@
++/*
++ * Copyright (C) 2011 Martin Willi
++ * Copyright (C) 2011 revosec AG
++ * Copyright (C) 2014 Politecnico di Torino, Italy
++ *                    TORSEC group -- http://security.polito.it
++ *
++ * Author: Roberto Sassu <roberto.sassu@polito.it>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include "oat_attest_plugin.h"
++
++#include "oat_attest_listener.h"
++
++#include <daemon.h>
++
++typedef struct private_oat_attest_plugin_t private_oat_attest_plugin_t;
++
++/**
++ * Private data of oat_attest plugin
++ */
++struct private_oat_attest_plugin_t {
++
++	/**
++	 * Implements plugin interface
++	 */
++	oat_attest_plugin_t public;
++
++	/**
++	 * Listener collecting expire information
++	 */
++	oat_attest_listener_t *listener;
++};
++
++METHOD(plugin_t, get_name, char*,
++	private_oat_attest_plugin_t *this)
++{
++	return "oat_attest";
++}
++
++/**
++ * Register listener
++ */
++static bool plugin_cb(private_oat_attest_plugin_t *this,
++		      plugin_feature_t *feature, bool reg, void *cb_data)
++{
++	if (reg)
++	{
++		charon->bus->add_listener(charon->bus, &this->listener->listener);
++	}
++	else
++	{
++		charon->bus->remove_listener(charon->bus, &this->listener->listener);
++	}
++	return TRUE;
++}
++
++METHOD(plugin_t, get_features, int,
++	private_oat_attest_plugin_t *this, plugin_feature_t *features[])
++{
++	static plugin_feature_t f[] = {
++		PLUGIN_CALLBACK((plugin_feature_callback_t)plugin_cb, NULL),
++			PLUGIN_PROVIDE(CUSTOM, "oat_attest"),
++	};
++	*features = f;
++	return countof(f);
++}
++
++METHOD(plugin_t, destroy, void,
++	private_oat_attest_plugin_t *this)
++{
++	this->listener->destroy(this->listener);
++	free(this);
++}
++
++/**
++ * Plugin constructor
++ */
++plugin_t *oat_attest_plugin_create()
++{
++	private_oat_attest_plugin_t *this;
++
++	INIT(this,
++		.public = {
++			.plugin = {
++				.get_name = _get_name,
++				.get_features = _get_features,
++				.destroy = _destroy,
++			},
++		},
++	);
++	this->listener = oat_attest_listener_create();
++
++	return &this->public.plugin;
++}
+diff --git a/src/libcharon/plugins/oat_attest/oat_attest_plugin.h b/src/libcharon/plugins/oat_attest/oat_attest_plugin.h
+new file mode 100644
+index 0000000..f745ce1
+--- /dev/null
++++ b/src/libcharon/plugins/oat_attest/oat_attest_plugin.h
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (C) 2011 Martin Willi
++ * Copyright (C) 2011 revosec AG
++ * Copyright (C) 2014 Politecnico di Torino, Italy
++ *                    TORSEC group -- http://security.polito.it
++ *
++ * Author: Roberto Sassu <roberto.sassu@polito.it>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++/**
++ * @defgroup oat_attest oat_attest
++ * @ingroup cplugins
++ *
++ * @defgroup oat_attest_plugin oat_attest_plugin
++ * @{ @ingroup oat_attest
++ */
++
++#ifndef OAT_ATTEST_PLUGIN_H_
++#define OAT_ATTEST_PLUGIN_H_
++
++#include <plugins/plugin.h>
++
++typedef struct oat_attest_plugin_t oat_attest_plugin_t;
++
++/**
++ * Plugin for attesting a peer with OpenAttestation.
++ */
++struct oat_attest_plugin_t {
++
++	/**
++	 * Implements plugin interface.
++	 */
++	plugin_t plugin;
++};
++
++#endif /** OAT_ATTEST_PLUGIN_H_ @}*/

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+# To disable prints from python
+#Terminal=false
+Terminal=true
+Name=SECURED App
+Path=/home/alice/netIT-Lab/gitlab/app/gui
+Icon=/home/alice/netIT-Lab/gitlab/app/gui/images/SECURED_logo.png
+Exec=/home/alice/netIT-Lab/gitlab/app/gui/start_gui
+
+
